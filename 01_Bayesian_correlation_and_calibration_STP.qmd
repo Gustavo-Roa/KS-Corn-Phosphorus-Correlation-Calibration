@@ -1,0 +1,741 @@
+---
+title: "Correlation and Calibration - Fertilizer Recommendations"
+subtitle: "A Bayesian Approach"
+author: "Gustavo A. Roa"
+date: "2026-03-27"
+format:
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    self-contained: true
+execute:
+  warning: false
+  message: false
+---
+
+# Overview
+
+Soil-test correlation and calibration are essential for developing fertilizer recommendations.This tutorial demonstrates how to estimate CSTVs using Bayesian nonlinear regression and Bayesian model averaging (BMA). It also illustrates how the resulting CSTV posterior distribution can be used to calibrate phosphorus fertilizer recommendations and account for uncertainty.
+
+# Setup
+
+## Prerequisites
+
+Before starting, make sure that R and RStudio are installed. This tutorial uses `brms` to fit Bayesian nonlinear regression models through Stan, which requires a working C++ toolchain to compile the statistical models.
+
+- **R:** The statistical programming environment.
+- **RStudio (recommended):** An integrated development environment for working with R and Quarto.
+- **C++ toolchain:** Required by Stan to compile the models used by `brms`. Windows users can install Rtools; macOS users need the Xcode Command Line Tools; Linux users need the appropriate compiler and development tools.
+
+For installation instructions, consult the official documentation:
+
+- [R](https://cran.r-project.org/)
+- [RStudio](https://posit.co/download/rstudio-desktop/)
+- [Rtools for Windows](https://cran.r-project.org/bin/windows/Rtools/)
+
+## Check the Installation
+
+Check the R version and verify that a C++ compiler is available.
+
+```{r}
+# Check the installed R version
+R.version.string
+
+# Check whether R can find a C++ compiler
+Sys.which(c("make", "g++", "clang++"))
+```
+
+## Required Packages
+
+The following packages are used for data manipulation, Bayesian modeling, and Bayesian model averaging.
+
+```{r}
+# Data manipulation
+library(tidyverse)
+
+# Data import
+library(readxl)
+
+# Bayesian modeling
+library(Rcpp)
+library(brms)
+
+# Marginal likelihood estimation and Bayesian model averaging
+library(bridgesampling)
+```
+
+## Import Data
+
+The example dataset contains the soil-test phosphorus (P) measurements, relative grain yield, and optimum fertilizer rates used in this tutorial. These data are used to estimate the Critical Soil Test Value (CSTV) and calculate phosphorus fertilizer recommendations.
+
+The dataset is provided as an Excel file named dataset_example.xlsx, with the data stored in a worksheet named data. Place the file in the same folder as this tutorial before running the code.
+
+```{r}
+# Import the experimental dataset
+data_example <- read_excel(
+  "./dataset_example.xlsx",
+  sheet = "data"
+)
+
+# Inspect the dataset structure
+str(data_example)
+
+
+```
+
+The dataset must include the following variables:
+
+soil_test: Soil-test phosphorus concentration.
+
+relative_yield: Relative grain yield used to fit the soil-test response models.
+
+optimun_fertilizer_rate: Optimum fertilizer rate used to estimate the maximum fertilizer rate.
+
+Use the same measurement units as those in the provided dataset throughout the analysis. The soil-test P values and fertilizer rates should not be converted unless the corresponding model equations and results are adjusted accordingly.
+
+The following sections use these variables to fit the Bayesian response models, estimate the CSTV, and calculate phosphorus fertilizer recommendations.
+
+# Bayesian Estimation of Critical Soil Test Values
+
+## Bayesian Quadratic-Plateau Model
+
+The quadratic-plateau (QP) model describes a quadratic increase in relative yield followed by a plateau. The parameter $x_s$ represents the soil-test phosphorus concentration at which the response reaches the plateau and is used as the CSTV estimate.
+
+```{r, fig.width=8, fig.height=8}
+# Define the Bayesian quadratic-plateau model
+bf_QP <- brms::bf(
+  relative_yield ~ a +
+    b * fmin(soil_test, xs) -
+    (b / (2 * xs)) * fmin(soil_test, xs)^2,
+  a ~ 1,
+  b ~ 1,
+  xs ~ 1,
+  nl = TRUE
+)
+
+# Specify priors for the model parameters
+priors_QP <- c(
+  brms::set_prior(
+    "normal(58.3, 0.5*58.3)",
+    nlpar = "a",
+    lb = 0
+  ),
+  brms::set_prior(
+    "normal(3.8, 0.5*3.8)",
+    nlpar = "b",
+    lb = 0
+  ),
+  brms::set_prior(
+    "normal(21.4, 0.5*21.4)",
+    nlpar = "xs",
+    lb = 0
+  ),
+  brms::set_prior(
+    "student_t(3, 0, 10)",
+    class = "sigma"
+  )
+)
+
+# Fit the Bayesian quadratic-plateau model
+fit_QP_bayes <- brms::brm(
+  formula = bf_QP,
+  data = data_example,
+  prior = priors_QP,
+  chains = 5,
+  iter = 3000,
+  warmup = 1000,
+  cores = 1,
+  seed = 555,
+  save_pars = brms::save_pars(all = TRUE),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 15
+  )
+)
+
+# Summary model results
+summary(fit_QP_bayes)
+
+# Extract posterior draws of the CSTV parameter
+xs_QP <- brms::as_draws_df(
+  fit_QP_bayes
+)$b_xs_Intercept
+
+# Calculate the posterior median and 95% credible interval
+xs_QP_hat <- median(xs_QP)
+
+xs_QP_ci <- quantile(
+  xs_QP,
+  probs = c(0.025, 0.975)
+)
+
+# Display the CSTV estimate and uncertainty
+cat("\nBayesian Quadratic-Plateau Model\n")
+cat(
+  "CSTV estimate:",
+  round(xs_QP_hat, 2),
+  "\n"
+)
+cat(
+  "95% Credible Interval:",
+  round(xs_QP_ci[1], 2),
+  "-",
+  round(xs_QP_ci[2], 2),
+  "\n"
+)
+```
+
+## Bayesian Linear-Plateau Model
+
+The linear-plateau (LP) model describes a linear increase in relative yield followed by a plateau. As in the QP model, $x_s$ represents the soil-test phosphorus concentration at which the response reaches the plateau.
+
+```{r, fig.width=8, fig.height=8}
+# Define the Bayesian linear-plateau model
+bf_LP <- brms::bf(
+  relative_yield ~ a + b * fmin(soil_test, xs),
+  a ~ 1,
+  b ~ 1,
+  xs ~ 1,
+  nl = TRUE
+)
+
+# Specify priors for the model parameters
+priors_LP <- c(
+  brms::set_prior(
+    "normal(64.5, 0.5*64.5)",
+    nlpar = "a",
+    lb = 0
+  ),
+  brms::set_prior(
+    "normal(2.25, 0.5*2.25)",
+    nlpar = "b",
+    lb = 0
+  ),
+  brms::set_prior(
+    "normal(15, 0.5*15)",
+    nlpar = "xs",
+    lb = 0
+  ),
+  brms::set_prior(
+    "student_t(3, 0, 10)",
+    class = "sigma"
+  )
+)
+
+# Fit the Bayesian linear-plateau model
+fit_LP_bayes <- brms::brm(
+  formula = bf_LP,
+  data = data_example,
+  prior = priors_LP,
+  chains = 5,
+  iter = 3000,
+  warmup = 1000,
+  cores = 1,
+  seed = 555,
+  save_pars = brms::save_pars(all = TRUE),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 15
+  )
+)
+
+# Summary(model results
+summary(fit_LP_bayes)
+
+# Extract posterior draws of the CSTV parameter
+xs_LP <- brms::as_draws_df(
+  fit_LP_bayes
+)$b_xs_Intercept
+
+# Calculate the posterior median and 95% credible interval
+xs_LP_hat <- median(xs_LP)
+
+xs_LP_ci <- quantile(
+  xs_LP,
+  probs = c(0.025, 0.975)
+)
+
+# Display the CSTV estimate and uncertainty
+cat("\nBayesian Linear-Plateau Model\n")
+cat(
+  "CSTV estimate:",
+  round(xs_LP_hat, 2),
+  "\n"
+)
+cat(
+  "95% Credible Interval:",
+  round(xs_LP_ci[1], 2),
+  "-",
+  round(xs_LP_ci[2], 2),
+  "\n"
+)
+```
+
+## Bayesian Exponential (Mitscherlich) Model
+
+The exponential model describes an asymptotic increase in relative yield as soil-test phosphorus increases. The parameter $x_s$ represents the soil-test phosphorus concentration corresponding to 95% of the asymptotic response.
+
+```{r, fig.width=8, fig.height=8}
+# Define the Bayesian exponential model
+bf_EXP <- brms::bf(
+  relative_yield ~ a -
+    b * exp(
+      -(log(b / (0.05 * a)) / xs) * soil_test
+    ),
+  a ~ 1,
+  b ~ 1,
+  xs ~ 1,
+  nl = TRUE
+)
+
+# Specify priors for the model parameters
+priors_EXP <- c(
+  brms::set_prior(
+    "normal(100, 0.5*100)",
+    nlpar = "a",
+    lb = 0
+  ),
+  brms::set_prior(
+    "normal(55, 0.5*55)",
+    nlpar = "b",
+    lb = 0
+  ),
+  brms::set_prior(
+    "normal(21.4, 0.5*21.4)",
+    nlpar = "xs",
+    lb = 0
+  ),
+  brms::set_prior(
+    "student_t(3, 0, 10)",
+    class = "sigma"
+  )
+)
+
+# Fit the Bayesian exponential model
+fit_EXP_bayes <- brms::brm(
+  formula = bf_EXP,
+  data = data_example,
+  prior = priors_EXP,
+  chains = 5,
+  iter = 3000,
+  warmup = 1000,
+  cores = 1,
+  seed = 555,
+  save_pars = brms::save_pars(all = TRUE),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 15
+  )
+)
+
+# Summary model results
+summary(fit_EXP_bayes)
+
+# Extract posterior draws of xs
+xs_EXP <- brms::as_draws_df(
+  fit_EXP_bayes
+)$b_xs_Intercept
+
+# Calculate the posterior median and 95% credible interval
+xs_EXP_hat <- median(xs_EXP)
+
+xs_EXP_ci <- quantile(
+  xs_EXP,
+  probs = c(0.025, 0.975)
+)
+
+# Display the CSTV estimate and uncertainty
+cat("\nBayesian Exponential (Mitscherlich) Model\n")
+cat(
+  "CSTV estimate:",
+  round(xs_EXP_hat, 2),
+  "\n"
+)
+cat(
+  "95% Credible Interval:",
+  round(xs_EXP_ci[1], 2),
+  "-",
+  round(xs_EXP_ci[2], 2),
+  "\n"
+)
+```
+
+# Bayesian Model Averaging
+
+Bayesian model averaging (BMA) combines the posterior distributions from the LP, QP, and exponential models. This approach incorporates uncertainty about which response model best describes the relationship between relative yield and soil-test phosphorus.
+
+## Estimate Marginal Likelihoods and Posterior Model Probabilities
+
+Marginal likelihoods are estimated using bridge sampling. These values are used to calculate posterior model probabilities, assigning equal prior probabilities to the three candidate models.
+
+```{r}
+# Estimate marginal likelihoods using bridge sampling
+bridge_LP <- bridgesampling::bridge_sampler(
+  fit_LP_bayes,
+  silent = TRUE
+)
+
+bridge_QP <- bridgesampling::bridge_sampler(
+  fit_QP_bayes,
+  silent = TRUE
+)
+
+bridge_EXP <- bridgesampling::bridge_sampler(
+  fit_EXP_bayes,
+  silent = TRUE
+)
+
+# Calculate posterior model probabilities
+model_prob <- bridgesampling::post_prob(
+  bridge_LP,
+  bridge_QP,
+  bridge_EXP,
+  prior_prob = c(1 / 3, 1 / 3, 1 / 3)
+)
+
+# Assign model names
+names(model_prob) <- c("LP", "QP", "EXP")
+
+# Display posterior model probabilities
+model_prob
+```
+
+The posterior model probabilities represent the relative support for each candidate model, conditional on the observed data, the specified priors, and the set of models considered.
+
+## Construct the Model-Averaged CSTV Posterior
+
+The model-averaged posterior is constructed by sampling models according to their posterior probabilities and then sampling a CSTV draw from the selected model's posterior distribution.
+
+```{r}
+# Set the random seed for reproducibility
+set.seed(555)
+
+# Extract posterior CSTV draws from each model
+draws_LP <- brms::as_draws_df(
+  fit_LP_bayes
+)[["b_xs_Intercept"]]
+
+draws_QP <- brms::as_draws_df(
+  fit_QP_bayes
+)[["b_xs_Intercept"]]
+
+draws_EXP <- brms::as_draws_df(
+  fit_EXP_bayes
+)[["b_xs_Intercept"]]
+
+# Define the number of model-averaged posterior draws
+n_draws <- 10000
+
+# Sample a model for each draw according to its posterior probability
+selected_model <- sample(
+  names(model_prob),
+  size = n_draws,
+  replace = TRUE,
+  prob = model_prob
+)
+
+# Initialize the model-averaged posterior distribution
+draws_BMA <- numeric(n_draws)
+
+# Sample CSTV draws from the selected model
+draws_BMA[selected_model == "LP"] <- sample(
+  draws_LP,
+  sum(selected_model == "LP"),
+  replace = TRUE
+)
+
+draws_BMA[selected_model == "QP"] <- sample(
+  draws_QP,
+  sum(selected_model == "QP"),
+  replace = TRUE
+)
+
+draws_BMA[selected_model == "EXP"] <- sample(
+  draws_EXP,
+  sum(selected_model == "EXP"),
+  replace = TRUE
+)
+
+# Retain the model-averaged CSTV posterior draws
+theta_bma_bt <- draws_BMA
+
+# Summarize the model-averaged posterior
+theta_bma_hat <- median(theta_bma_bt)
+
+theta_bma_ci <- quantile(
+  theta_bma_bt,
+  probs = c(0.025, 0.975)
+)
+
+# Display the model-averaged CSTV estimate and credible interval
+theta_bma_hat 
+theta_bma_ci
+```
+
+The resulting model-averaged posterior incorporates both parameter uncertainty within each model and uncertainty about which model generated the observed response pattern.
+
+## Results Table for CSTV
+
+The results table summarizes the CSTV estimate and 95% credible interval for the model-averaged posterior and each individual model. The posterior model probabilities are also reported for the LP, QP, and exponential models.
+
+```{r}
+# Format CSTV estimates and 95% credible intervals
+format_cstv <- function(estimate, interval) {
+  sprintf(
+    "%d [95%% CrI: %d-%d]",
+    round(estimate),
+    round(interval[1]),
+    round(interval[2])
+  )
+}
+
+# Assemble the CSTV results table
+tab_CSTV <- data.frame(
+  `Model Average` = format_cstv(
+    theta_bma_hat,
+    theta_bma_ci
+  ),
+
+  `Linear Plateau` = sprintf(
+    "%s (W = %.2f)",
+    format_cstv(xs_LP_hat, xs_LP_ci),
+    unname(model_prob["LP"])
+  ),
+
+  `Quadratic Plateau` = sprintf(
+    "%s (W = %.2f)",
+    format_cstv(xs_QP_hat, xs_QP_ci),
+    unname(model_prob["QP"])
+  ),
+
+  `Exponential` = sprintf(
+    "%s (W = %.2f)",
+    format_cstv(xs_EXP_hat, xs_EXP_ci),
+    unname(model_prob["EXP"])
+  ),
+
+  check.names = FALSE
+)
+
+tab_CSTV
+```
+
+# Bayesian Calibration of Fertilizer Recommendations
+
+## Summarize the CSTV Posterior
+
+The model-averaged Critical Soil Test Value (CSTV) is summarized using its posterior median and 95% credible interval. The median CSTV is used to calculate the phosphorus deficiency index.
+
+```{r}
+# Summarize the model-averaged CSTV posterior
+cstv_median <- median(theta_bma_bt, na.rm = TRUE)
+
+cstv_ci <- quantile(
+  theta_bma_bt,
+  probs = c(0.025, 0.975),
+  na.rm = TRUE
+)
+
+cstv_median
+cstv_ci
+```
+
+## Calculate the Deficiency Index
+
+The deficiency index represents the relative need for phosphorus fertilizer:
+
+$$
+z_i = \max\left(0, 1 - \frac{STP_i}{CSTV_{\mathrm{median}}}\right)
+$$
+
+The index decreases to zero as soil-test P approaches or exceeds the median CSTV.
+
+```{r}
+# Calculate the phosphorus deficiency index
+data_example <- data_example |>
+  dplyr::mutate(
+    z = pmax(0, 1 - soil_test / cstv_median)
+  )
+```
+
+## Estimate the Maximum Fertilizer Rate
+
+This model estimates the maximum fertilizer rate, $P_{\max}$, from the observed optimum fertilizer rates and the phosphorus deficiency index, $z_i$.
+
+$$
+OFR_i = P_{\max} z_i + \varepsilon_i
+$$
+
+Here, $OFR_i$ is the observed optimum fertilizer rate for observation $i$, $P_{\max}$ is the maximum fertilizer rate, $z_i$ is the deficiency index, and $\varepsilon_i$ is the residual error.
+
+```{r}
+# Fit the model
+fit_rec <- brms::brm(
+  optimun_fertilizer_rate ~ 0 + z,
+  data = data_example,
+  family = gaussian(),
+  prior = brms::set_prior(
+    "normal(60, 30)",
+    class = "b",
+    lb = 0
+  ),
+  chains = 5,
+  iter = 3000,
+  warmup = 1000,
+  cores = 1,
+  seed = 555,
+  save_pars = brms::save_pars(all = TRUE),
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 15
+  )
+)
+
+# Inspect model results
+summary(fit_rec)
+```
+
+## Summarize the Maximum Fertilizer Rate
+
+The posterior median and 95% credible interval of the regression coefficient summarize $P_{max}$.
+
+```{r}
+# Extract posterior draws of Pmax
+alpha_draws <- brms::as_draws_df(fit_rec)$b_z
+
+# Summarize Pmax
+Pmax_hat <- median(alpha_draws)
+
+Pmax_ci <- quantile(
+  alpha_draws,
+  probs = c(0.025, 0.975)
+)
+
+Pmax_hat
+Pmax_ci
+```
+
+## Calculate Fertilizer Recommendations
+
+The representative fertilizer recommendation is calculated using the median estimates of $P_{max}$ and CSTV:
+
+$$
+P_{\mathrm{rec}}(STP) =
+P_{\max,\mathrm{median}}
+\max\left(0,1-\frac{STP}{CSTV_{\mathrm{median}}}\right)
+$$
+
+The recommendation range is calculated by substituting the lower and upper CSTV bounds into the equation while holding $P_{max}$ at its median. The lower CSTV bound gives the upper recommendation, whereas the upper CSTV bound gives the lower recommendation.
+
+This range reflects uncertainty in CSTV only. It is not a 95% credible interval for the fertilizer recommendation because uncertainty in $P_{max}$ is not propagated.
+
+```{r}
+# Calculate the representative recommendation and its range
+calculate_recommendation <- function(stp, pmax_rate, cstv) {
+  pmax_rate * pmax(0, 1 - stp / cstv)
+}
+
+# Report the representative recommendation equation
+cat(
+  sprintf(
+    "\nP_rec = %.2f * max(0, 1 - STP / %.2f)\n",
+    Pmax_hat,
+    cstv_median
+  )
+)
+
+# Report CSTV median and 95% credible interval
+cat(
+  sprintf(
+    "CSTV: %.2f (95%% CrI: %.2f to %.2f)\n",
+    cstv_median,
+    cstv_ci[1],
+    cstv_ci[2]
+  )
+)
+
+# Report Pmax median and 95% credible interval
+cat(
+  sprintf(
+    "Pmax: %.2f (95%% CrI: %.2f to %.2f)\n",
+    Pmax_hat,
+    Pmax_ci[1],
+    Pmax_ci[2]
+  )
+)
+```
+
+# Summary of Results
+
+## Critical Soil Test Value
+
+```{r}
+# Summarize CSTV estimates and model weights
+tab_CSTV_summary <- data.frame(
+  Model = c(
+    "BMA",
+    "Linear-Plateau",
+    "Quadratic-Plateau",
+    "Exponential"
+  ),
+  Median = c(
+    theta_bma_hat,
+    xs_LP_hat,
+    xs_QP_hat,
+    xs_EXP_hat
+  ),
+  Lower_95_CrI = c(
+    theta_bma_ci[1],
+    xs_LP_ci[1],
+    xs_QP_ci[1],
+    xs_EXP_ci[1]
+  ),
+  Upper_95_CrI = c(
+    theta_bma_ci[2],
+    xs_LP_ci[2],
+    xs_QP_ci[2],
+    xs_EXP_ci[2]
+  ),
+  Model_Weight = c(
+    NA,
+    model_prob["LP"],
+    model_prob["QP"],
+    model_prob["EXP"]
+  )
+)
+
+knitr::kable(
+  tab_CSTV_summary,
+  digits = 2,
+  col.names = c(
+    "Model",
+    "Median CSTV",
+    "Lower 95% CrI",
+    "Upper 95% CrI",
+    "Model Weight"
+  ),
+  caption = "CSTV posterior summaries and model weights"
+)
+```
+
+## Fertilizer Recommendation
+
+
+```{r, results='asis', echo=FALSE}
+cat(sprintf(
+  "- **CSTV:** %d [95%% CrI: %d-%d]\n\n- **Pmax:** %d [95%% CrI: %d-%d]\n",
+  round(cstv_median),
+  round(cstv_ci[1]),
+  round(cstv_ci[2]),
+  round(Pmax_hat),
+  round(Pmax_ci[1]),
+  round(Pmax_ci[2])
+))
+```
+
+The final equation calculates the fertilizer recommendation using the soil-test phosphorus value (STP), the median CSTV, and the median maximum fertilizer rate $P_{\max}$. To calculate a recommendation, substitute your soil-test P value and use the CSTV and $P_{\max}$ estimates reported above. If STP is equal to or greater than CSTV, the recommendation is zero.
+
+$$
+P_{\mathrm{rec}} = P_{\max}\left(1-\frac{STP}{CSTV}\right)
+$$
